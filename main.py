@@ -54,18 +54,28 @@ async def api_request(session: aiohttp.ClientSession, endpoint: str, params: dic
         return {"response": []}
 
 
-async def search_teams(query: str) -> List[app_commands.Choice[str]]:
-    if len(query) < 2:
-        return []
+async def team_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    if len(current) < 2:
+        return [
+            app_commands.Choice(name="Type at least 2 characters...", value="none")
+        ]
     
-    cache_key = query.lower()
+    cache_key = current.lower()
     if cache_key in team_cache:
         teams = team_cache[cache_key]
     else:
         async with aiohttp.ClientSession() as session:
-            data = await api_request(session, "teams", {"search": query})
+            data = await api_request(session, "teams", {"search": current})
         teams = data.get("response", [])
         team_cache[cache_key] = teams
+    
+    if not teams:
+        return [
+            app_commands.Choice(name="No teams found", value="none")
+        ]
     
     choices = []
     for team in teams[:25]:
@@ -129,9 +139,18 @@ async def on_ready():
 
 @tree.command(name="live", description="Show live match for a specific team")
 @app_commands.describe(team_name="Team name to check live match")
-@app_commands.autocomplete(team_name=search_teams)
+@app_commands.autocomplete(team_name=team_autocomplete)
 async def live_matches(interaction: discord.Interaction, team_name: str):
     await interaction.response.defer()
+    
+    if team_name == "none":
+        embed = discord.Embed(
+            title="❌ Invalid Selection",
+            description="Please type a valid team name.",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+        return
     
     async with aiohttp.ClientSession() as session:
         search_data = await api_request(session, "teams", {"search": team_name})
@@ -259,9 +278,18 @@ async def league_matches(interaction: discord.Interaction, league_name: str):
 
 @tree.command(name="team", description="Show fixtures for a specific team")
 @app_commands.describe(team_name="Team name to search")
-@app_commands.autocomplete(team_name=search_teams)
+@app_commands.autocomplete(team_name=team_autocomplete)
 async def team_fixtures(interaction: discord.Interaction, team_name: str):
     await interaction.response.defer()
+    
+    if team_name == "none":
+        embed = discord.Embed(
+            title="❌ Invalid Selection",
+            description="Please type a valid team name.",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+        return
     
     async with aiohttp.ClientSession() as session:
         search_data = await api_request(session, "teams", {"search": team_name})
