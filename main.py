@@ -1,21 +1,21 @@
 # main.py
-# Discord Football Bot - Stateful Mock Engine
-# Fixes: Random score jumps, inconsistent match state, duplicate goals
+# Discord Football Bot - Real-time data from football-data.org
+# Free tier: 10 requests/min, covers La Liga, EPL, UCL
 
 import discord
 from discord import app_commands
 from discord.ext import tasks
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 import asyncio
-import random
+import aiohttp
 from typing import Dict, List, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 # ============================================================================
-# LOGGING CONFIGURATION
+# LOGGING
 # ============================================================================
 
 logging.basicConfig(
@@ -25,79 +25,42 @@ logging.basicConfig(
 logger = logging.getLogger('football_bot')
 
 # ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+FOOTBALL_API_KEY = os.getenv('FOOTBALL_API_KEY')  # Add to Railway env vars
+FOOTBALL_API_BASE = "https://api.football-data.org/v4"
+
+# Competition IDs
+COMPETITIONS = {
+    'laliga': 'PD',   # Primera División
+    'epl': 'PL',      # Premier League
+    'ucl': 'CL'       # Champions League
+}
+
+# ============================================================================
 # DATA MODELS
 # ============================================================================
 
-class MatchStatus(Enum):
-    """Match status enum for type safety"""
-    SCHEDULED = "SCH"
-    LIVE = "LIVE"
-    HALF_TIME = "HT"
-    FULL_TIME = "FT"
-
 @dataclass
 class Match:
-    """
-    Stateful match object that persists throughout bot lifecycle.
-    Scores and minutes increment gradually, never jump randomly.
-    """
-    id: str
+    """Real match data from API"""
+    id: int
     league: str
     home: str
     away: str
-    home_score: int = 0
-    away_score: int = 0
-    minute: int = 0
-    status: MatchStatus = MatchStatus.SCHEDULED
-    kickoff_time: datetime = field(default_factory=datetime.utcnow)
+    home_score: int
+    away_score: int
+    minute: int
+    status: str  # SCHEDULED, LIVE, IN_PLAY, PAUSED, FINISHED
+    utc_date: str
     
-    # Internal tracking for gradual updates
-    _last_goal_minute: int = 0
-    _goals_this_match: List[tuple] = field(default_factory=list)  # (minute, team, score)
-    
-    def can_score_goal(self) -> bool:
-        """Prevent unrealistic goal frequency (min 5 minutes between goals)"""
-        if self.status != MatchStatus.LIVE:
-            return False
-        return (self.minute - self._last_goal_minute) >= 5
-    
-    def add_goal(self, team: str) -> bool:
-        """
-        Add a goal to the specified team.
-        Returns True if goal was added, False if invalid.
-        """
-        if not self.can_score_goal():
-            return False
-        
-        if team == 'home':
-            self.home_score += 1
-        elif team == 'away':
-            self.away_score += 1
-        else:
-            return False
-        
-        self._last_goal_minute = self.minute
-        self._goals_this_match.append((self.minute, team, f"{self.home_score}-{self.away_score}"))
-        return True
-    
-    def advance_minute(self, minutes: int = 1):
-        """Advance match time gradually"""
-        if self.status == MatchStatus.LIVE:
-            self.minute = min(self.minute + minutes, 90)
-            
-            # Check for full-time
-            if self.minute >= 90:
-                self.status = MatchStatus.FULL_TIME
-    
-    def start_match(self):
-        """Transition from scheduled to live"""
-        if self.status == MatchStatus.SCHEDULED:
-            self.status = MatchStatus.LIVE
-            self.minute = 1
-            logger.info(f"⚽ Match started: {self.home} vs {self.away}")
+    def is_target_match(self) -> bool:
+        """Check if Real Madrid or Barcelona is playing"""
+        targets = ['Real Madrid', 'Barcelona', 'FC Barcelona']
+        return any(team in self.home or team in self.away for team in targets)
     
     def to_dict(self) -> dict:
-        """Convert to dict for backwards compatibility"""
         return {
             'id': self.id,
             'league': self.league,
@@ -106,191 +69,175 @@ class Match:
             'home_score': self.home_score,
             'away_score': self.away_score,
             'minute': self.minute,
-            'status': self.status.value
+            'status': self.status
         }
 
 # ============================================================================
-# STATEFUL MATCH ENGINE (SINGLE SOURCE OF TRUTH)
+# FOOTBALL DATA API CLIENT
 # ============================================================================
 
-class MatchEngine:
+class FootballDataAPI:
     """
-    Centralized match state manager.
-    Initializes matches ONCE on startup, then updates them gradually.
-    All slash commands and background tasks read from this shared state.
+    Client for football-data.org API
+    Handles rate limiting, error handling, and data parsing
     """
     
-    def __init__(self):
-        self.matches: Dict[str, Match] = {}
-        self.initialized = False
-        
-        # Track what we've announced to prevent duplicates
-        self.announced_goals: Dict[str, set] = {}  # match_id -> set of score strings
-        self.announced_ft: set = set()  # match_ids that had FT announced
-        
-    def initialize_matches(self):
-        """
-        CALLED ONCE ON STARTUP.
-        Creates initial match fixtures with realistic distribution.
-        """
-        if self.initialized:
-            logger.warning("Match engine already initialized, skipping")
-            return
-        
-        teams = {
-            'laliga': ['Real Madrid', 'Barcelona', 'Atletico Madrid', 'Sevilla', 'Real Betis', 'Valencia'],
-            'epl': ['Manchester City', 'Arsenal', 'Liverpool', 'Chelsea', 'Manchester United', 'Tottenham'],
-            'ucl': ['Real Madrid', 'Barcelona', 'Bayern Munich', 'PSG', 'Man City', 'Inter Milan']
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = FOOTBALL_API_BASE
+        self.headers = {
+            'X-Auth-Token': api_key
         }
+        self.session: Optional[aiohttp.ClientSession] = None
         
-        target_teams = ['Real Madrid', 'Barcelona']
+        # Cache to track score changes
+        self.previous_scores: Dict[int, tuple] = {}  # match_id -> (home, away)
+        self.announced_ft: set = set()
+    
+    async def _ensure_session(self):
+        """Create aiohttp session if not exists"""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(headers=self.headers)
+    
+    async def close(self):
+        """Close aiohttp session"""
+        if self.session and not self.session.closed:
+            await self.session.close()
+    
+    async def _get(self, endpoint: str) -> dict:
+        """Make GET request to API"""
+        await self._ensure_session()
         
-        # Create 1-2 matches per league with target teams
-        for league in ['laliga', 'epl', 'ucl']:
-            # Higher chance of target teams in LaLiga and UCL
-            should_create = True if league in ['laliga', 'ucl'] else random.random() > 0.3
-            
-            if should_create:
-                # Pick Real Madrid or Barcelona
-                home_team = random.choice(target_teams)
+        url = f"{self.base_url}/{endpoint}"
+        
+        try:
+            async with self.session.get(url) as response:
+                if response.status == 429:
+                    logger.warning("⚠️ Rate limit hit, waiting 60 seconds")
+                    await asyncio.sleep(60)
+                    return await self._get(endpoint)
                 
-                # Pick opponent
-                available = [t for t in teams[league] if t not in target_teams]
-                if not available:
-                    continue
+                if response.status != 200:
+                    logger.error(f"API error {response.status}: {await response.text()}")
+                    return {}
                 
-                away_team = random.choice(available)
+                return await response.json()
+        
+        except Exception as e:
+            logger.error(f"Request failed: {e}")
+            return {}
+    
+    async def get_matches_by_competition(self, competition_code: str, status: str = None) -> List[Match]:
+        """
+        Get matches for a competition
+        status: SCHEDULED, LIVE, IN_PLAY, PAUSED, FINISHED, or None for all
+        """
+        endpoint = f"competitions/{competition_code}/matches"
+        if status:
+            endpoint += f"?status={status}"
+        
+        data = await self._get(endpoint)
+        
+        if not data or 'matches' not in data:
+            return []
+        
+        matches = []
+        
+        for match_data in data['matches']:
+            try:
+                # Parse match status
+                status = match_data.get('status', 'SCHEDULED')
                 
-                # Randomly swap home/away
-                if random.random() > 0.5:
-                    home_team, away_team = away_team, home_team
+                # Parse scores
+                score = match_data.get('score', {})
+                fulltime = score.get('fullTime', {})
+                home_score = fulltime.get('home') or 0
+                away_score = fulltime.get('away') or 0
                 
-                # Create match ID
-                match_id = f"{league}_{home_team}_{away_team}".replace(' ', '_').lower()
+                # Parse minute (only available during live matches)
+                minute = match_data.get('minute') or 0
                 
-                # Determine initial status
-                # 40% start LIVE, 30% scheduled (will start later), 30% already in progress
-                rand = random.random()
-                
-                if rand < 0.4:
-                    # Match is live from start
-                    status = MatchStatus.LIVE
-                    minute = random.randint(1, 30)  # Early in match
-                    home_score = random.randint(0, 1)
-                    away_score = random.randint(0, 1)
-                elif rand < 0.7:
-                    # Match scheduled, will start in 1-3 update cycles
-                    status = MatchStatus.SCHEDULED
-                    minute = 0
-                    home_score = 0
-                    away_score = 0
-                else:
-                    # Match already in progress (mid-game)
-                    status = MatchStatus.LIVE
-                    minute = random.randint(45, 75)
-                    home_score = random.randint(0, 2)
-                    away_score = random.randint(0, 2)
+                # Map competition code back to our league names
+                league = next(
+                    (k for k, v in COMPETITIONS.items() if v == competition_code),
+                    competition_code.lower()
+                )
                 
                 match = Match(
-                    id=match_id,
+                    id=match_data['id'],
                     league=league,
-                    home=home_team,
-                    away=away_team,
+                    home=match_data['homeTeam']['name'],
+                    away=match_data['awayTeam']['name'],
                     home_score=home_score,
                     away_score=away_score,
                     minute=minute,
-                    status=status
+                    status=status,
+                    utc_date=match_data.get('utcDate', '')
                 )
                 
-                self.matches[match_id] = match
-                self.announced_goals[match_id] = {f"{home_score}-{away_score}"}
-                
-                logger.info(
-                    f"📋 Created match: {home_team} vs {away_team} "
-                    f"[{league.upper()}] - Status: {status.value}"
-                )
-        
-        self.initialized = True
-        logger.info(f"✅ Match engine initialized with {len(self.matches)} matches")
-    
-    def update_matches(self) -> List[tuple]:
-        """
-        CALLED BY BACKGROUND TASK.
-        Gradually advances match state:
-        - Increment minutes
-        - Randomly add goals (with realistic constraints)
-        - Transition scheduled → live → full-time
-        
-        Returns list of (match, event_type) tuples for notification
-        """
-        events = []  # (match, 'GOAL' or 'FT')
-        
-        for match in list(self.matches.values()):
+                matches.append(match)
             
-            # ================================================================
-            # SCHEDULED → LIVE transition
-            # ================================================================
-            if match.status == MatchStatus.SCHEDULED:
-                # 20% chance to start each update cycle
-                if random.random() < 0.2:
-                    match.start_match()
+            except Exception as e:
+                logger.error(f"Failed to parse match: {e}")
+                continue
+        
+        return matches
+    
+    async def get_live_matches(self) -> List[Match]:
+        """Get all live matches across all competitions"""
+        all_matches = []
+        
+        for league, comp_code in COMPETITIONS.items():
+            matches = await self.get_matches_by_competition(comp_code, status="IN_PLAY")
+            all_matches.extend(matches)
             
-            # ================================================================
-            # LIVE matches: advance time and potentially add goals
-            # ================================================================
-            elif match.status == MatchStatus.LIVE:
-                # Advance by 1-3 minutes per update
-                match.advance_minute(random.randint(1, 3))
-                
-                # Goal probability increases as match progresses
-                # Early game: 10%, late game: 25%
-                goal_chance = 0.10 + (match.minute / 90) * 0.15
-                
-                if random.random() < goal_chance and match.can_score_goal():
-                    # Randomly pick which team scores
-                    scoring_team = random.choice(['home', 'away'])
-                    
-                    if match.add_goal(scoring_team):
-                        # New goal! Record for notification
-                        current_score = f"{match.home_score}-{match.away_score}"
-                        
-                        if current_score not in self.announced_goals[match.id]:
-                            events.append((match, 'GOAL'))
-                            self.announced_goals[match.id].add(current_score)
-                
-                # Check if match just finished
-                if match.status == MatchStatus.FULL_TIME and match.id not in self.announced_ft:
-                    events.append((match, 'FT'))
-                    self.announced_ft.add(match.id)
+            # Small delay to respect rate limits
+            await asyncio.sleep(0.5)
         
-        return events
+        return all_matches
     
-    def get_live_matches(self) -> List[Match]:
-        """Get all currently live matches"""
-        return [m for m in self.matches.values() if m.status == MatchStatus.LIVE]
-    
-    def get_matches_by_league(self, league: str, target_teams: List[str]) -> List[Match]:
-        """Get matches for specific league with target teams"""
-        return [
-            m for m in self.matches.values()
-            if m.league == league and (m.home in target_teams or m.away in target_teams)
-        ]
-    
-    def cleanup_finished_matches(self):
-        """Remove matches that finished 10+ minutes ago (in real time)"""
-        to_remove = [
-            match_id for match_id, match in self.matches.items()
-            if match.status == MatchStatus.FULL_TIME and match_id in self.announced_ft
-        ]
+    async def get_target_team_matches(self, league: str) -> List[Match]:
+        """Get Real Madrid/Barcelona matches for specific league"""
+        comp_code = COMPETITIONS.get(league)
+        if not comp_code:
+            return []
         
-        # In production, you'd check actual time elapsed
-        # For demo, we'll remove after announcing FT
-        for match_id in to_remove:
-            # Keep for a few cycles, then remove
-            pass  # Implement time-based cleanup if needed
+        matches = await self.get_matches_by_competition(comp_code)
+        
+        # Filter for target teams
+        return [m for m in matches if m.is_target_match()]
+    
+    def detect_goals(self, match: Match) -> bool:
+        """
+        Detect if a new goal was scored since last check
+        Returns True if score changed
+        """
+        match_id = match.id
+        current_score = (match.home_score, match.away_score)
+        
+        if match_id not in self.previous_scores:
+            # First time seeing this match
+            self.previous_scores[match_id] = current_score
+            return False
+        
+        old_score = self.previous_scores[match_id]
+        
+        if current_score != old_score:
+            # Score changed - GOAL!
+            self.previous_scores[match_id] = current_score
+            return True
+        
+        return False
+    
+    def should_announce_ft(self, match: Match) -> bool:
+        """Check if FT should be announced"""
+        if match.status == 'FINISHED' and match.id not in self.announced_ft:
+            self.announced_ft.add(match.id)
+            return True
+        return False
 
-# Global match engine instance (single source of truth)
-match_engine = MatchEngine()
+# Global API client
+football_api = FootballDataAPI(FOOTBALL_API_KEY) if FOOTBALL_API_KEY else None
 
 # ============================================================================
 # BOT SETUP
@@ -302,7 +249,6 @@ intents.message_content = False
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Sync guards
 _sync_completed = False
 _tasks_started = False
 
@@ -312,12 +258,6 @@ _tasks_started = False
 
 @client.event
 async def on_ready():
-    """
-    Startup sequence:
-    1. Initialize match engine ONCE
-    2. Sync slash commands
-    3. Start background tasks
-    """
     global _sync_completed, _tasks_started
     
     if _sync_completed:
@@ -326,14 +266,12 @@ async def on_ready():
     
     logger.info(f'🤖 Bot logged in as {client.user}')
     
-    # ========================================================================
-    # CRITICAL: Initialize match engine BEFORE anything else
-    # ========================================================================
-    match_engine.initialize_matches()
+    # Check API key
+    if not football_api:
+        logger.error('❌ FOOTBALL_API_KEY not set - bot will not work!')
+        return
     
-    # ========================================================================
-    # Sync slash commands to guilds
-    # ========================================================================
+    # Sync commands
     total_synced = 0
     for guild in client.guilds:
         try:
@@ -345,236 +283,262 @@ async def on_ready():
             logger.error(f'❌ Sync failed for {guild.name}: {e}')
     
     _sync_completed = True
-    
-    # Wait for Discord to process commands
     await asyncio.sleep(3)
     
-    # ========================================================================
     # Start background tasks
-    # ========================================================================
     if not _tasks_started:
-        match_updater.start()
-        await asyncio.sleep(1)
         match_monitor.start()
         _tasks_started = True
-        logger.info('🚀 Bot fully operational')
+        logger.info('🚀 Bot fully operational with real-time data')
 
 # ============================================================================
-# SLASH COMMANDS (READ FROM SHARED STATE)
+# SLASH COMMANDS
 # ============================================================================
 
-@tree.command(name="ping", description="Check bot responsiveness")
+@tree.command(name="ping", description="Check bot status")
 async def ping(interaction: discord.Interaction):
-    """Health check"""
     latency = round(client.latency * 1000)
     embed = discord.Embed(
         title="🏓 Pong!",
-        description=f"Latency: {latency}ms",
+        description=f"Bot is online with real-time football data",
         color=discord.Color.green()
     )
+    embed.add_field(name="Latency", value=f"{latency}ms", inline=True)
+    embed.add_field(name="Data Source", value="football-data.org", inline=True)
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="live", description="Show all live matches")
 async def live(interaction: discord.Interaction):
-    """Display live matches from shared state"""
     await interaction.response.defer()
     
-    live_matches = match_engine.get_live_matches()
-    
-    if not live_matches:
-        embed = discord.Embed(
-            title="❌ No Live Matches",
-            description="এখন কোনো লাইভ ম্যাচ নেই",
-            color=discord.Color.red()
-        )
-        await interaction.followup.send(embed=embed)
+    if not football_api:
+        await interaction.followup.send("❌ API key not configured")
         return
     
-    embed = discord.Embed(
-        title="🔴 Live Matches",
-        color=discord.Color.red(),
-        timestamp=datetime.utcnow()
-    )
-    
-    for match in live_matches:
-        match_info = (
-            f"**{match.home} {match.home_score} - {match.away_score} {match.away}**\n"
-            f"⏱️ {match.minute}' | 🏆 {match.league.upper()}"
+    try:
+        live_matches = await football_api.get_live_matches()
+        
+        if not live_matches:
+            embed = discord.Embed(
+                title="❌ No Live Matches",
+                description="এখন কোনো লাইভ ম্যাচ নেই",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        embed = discord.Embed(
+            title="🔴 Live Matches",
+            color=discord.Color.red(),
+            timestamp=datetime.utcnow()
         )
-        embed.add_field(
-            name=f"{match.league.upper()}",
-            value=match_info,
-            inline=False
-        )
+        
+        for match in live_matches:
+            match_info = (
+                f"**{match.home} {match.home_score} - {match.away_score} {match.away}**\n"
+                f"⏱️ {match.minute}' | 🏆 {match.league.upper()}"
+            )
+            embed.add_field(
+                name=f"{match.league.upper()}",
+                value=match_info,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Requested by {interaction.user.name} • Real-time data")
+        await interaction.followup.send(embed=embed)
     
-    embed.set_footer(text=f"Requested by {interaction.user.name}")
-    await interaction.followup.send(embed=embed)
-    logger.info(f'📺 /live used by {interaction.user}')
+    except Exception as e:
+        logger.error(f"Error in /live: {e}")
+        await interaction.followup.send("❌ Failed to fetch live matches")
 
 @tree.command(name="laliga", description="Real Madrid/Barcelona in La Liga")
 async def laliga(interaction: discord.Interaction):
-    """La Liga matches from shared state"""
     await interaction.response.defer()
     
-    target_teams = ['Real Madrid', 'Barcelona']
-    matches = match_engine.get_matches_by_league('laliga', target_teams)
-    
-    if not matches:
-        embed = discord.Embed(
-            title="ℹ️ No Matches",
-            description="আজ Real Madrid / Barcelona এর ম্যাচ নেই",
-            color=discord.Color.blue()
-        )
-        await interaction.followup.send(embed=embed)
+    if not football_api:
+        await interaction.followup.send("❌ API key not configured")
         return
     
-    embed = discord.Embed(
-        title="⚽ La Liga - Real Madrid / Barcelona",
-        color=discord.Color.blue(),
-        timestamp=datetime.utcnow()
-    )
-    
-    for match in matches:
-        status_emoji = {
-            MatchStatus.LIVE: '🔴',
-            MatchStatus.FULL_TIME: '⚪',
-            MatchStatus.SCHEDULED: '🕐'
-        }.get(match.status, '⚽')
+    try:
+        matches = await football_api.get_target_team_matches('laliga')
         
-        match_info = (
-            f"{status_emoji} **{match.home} {match.home_score} - {match.away_score} {match.away}**\n"
-            f"Status: {match.status.value} | Minute: {match.minute}'"
+        if not matches:
+            embed = discord.Embed(
+                title="ℹ️ No Matches",
+                description="আজ Real Madrid / Barcelona এর ম্যাচ নেই",
+                color=discord.Color.blue()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        embed = discord.Embed(
+            title="⚽ La Liga - Real Madrid / Barcelona",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
         )
-        embed.add_field(
-            name=f"{match.home} vs {match.away}",
-            value=match_info,
-            inline=False
-        )
+        
+        for match in matches:
+            status_emoji = {
+                'IN_PLAY': '🔴',
+                'LIVE': '🔴',
+                'FINISHED': '⚪',
+                'SCHEDULED': '🕐'
+            }.get(match.status, '⚽')
+            
+            match_info = (
+                f"{status_emoji} **{match.home} {match.home_score} - {match.away_score} {match.away}**\n"
+                f"Status: {match.status}"
+            )
+            
+            if match.minute > 0:
+                match_info += f" | {match.minute}'"
+            
+            embed.add_field(
+                name=f"{match.home} vs {match.away}",
+                value=match_info,
+                inline=False
+            )
+        
+        embed.set_footer(text="Real-time data from football-data.org")
+        await interaction.followup.send(embed=embed)
     
-    await interaction.followup.send(embed=embed)
-    logger.info(f'🇪🇸 /laliga used by {interaction.user}')
+    except Exception as e:
+        logger.error(f"Error in /laliga: {e}")
+        await interaction.followup.send("❌ Failed to fetch La Liga matches")
 
 @tree.command(name="epl", description="Real Madrid/Barcelona in Premier League")
 async def epl(interaction: discord.Interaction):
-    """EPL matches from shared state"""
     await interaction.response.defer()
     
-    target_teams = ['Real Madrid', 'Barcelona']
-    matches = match_engine.get_matches_by_league('epl', target_teams)
-    
-    if not matches:
-        embed = discord.Embed(
-            title="ℹ️ No Matches",
-            description="আজ Real Madrid / Barcelona এর ম্যাচ নেই",
-            color=discord.Color.blue()
-        )
-        await interaction.followup.send(embed=embed)
+    if not football_api:
+        await interaction.followup.send("❌ API key not configured")
         return
     
-    embed = discord.Embed(
-        title="⚽ Premier League - Real Madrid / Barcelona",
-        color=discord.Color.purple(),
-        timestamp=datetime.utcnow()
-    )
-    
-    for match in matches:
-        status_emoji = {
-            MatchStatus.LIVE: '🔴',
-            MatchStatus.FULL_TIME: '⚪',
-            MatchStatus.SCHEDULED: '🕐'
-        }.get(match.status, '⚽')
+    try:
+        matches = await football_api.get_target_team_matches('epl')
         
-        match_info = (
-            f"{status_emoji} **{match.home} {match.home_score} - {match.away_score} {match.away}**\n"
-            f"Status: {match.status.value} | Minute: {match.minute}'"
+        if not matches:
+            embed = discord.Embed(
+                title="ℹ️ No Matches",
+                description="আজ Real Madrid / Barcelona এর ম্যাচ নেই",
+                color=discord.Color.blue()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        embed = discord.Embed(
+            title="⚽ Premier League - Real Madrid / Barcelona",
+            color=discord.Color.purple(),
+            timestamp=datetime.utcnow()
         )
-        embed.add_field(
-            name=f"{match.home} vs {match.away}",
-            value=match_info,
-            inline=False
-        )
+        
+        for match in matches:
+            status_emoji = {
+                'IN_PLAY': '🔴',
+                'LIVE': '🔴',
+                'FINISHED': '⚪',
+                'SCHEDULED': '🕐'
+            }.get(match.status, '⚽')
+            
+            match_info = (
+                f"{status_emoji} **{match.home} {match.home_score} - {match.away_score} {match.away}**\n"
+                f"Status: {match.status}"
+            )
+            
+            if match.minute > 0:
+                match_info += f" | {match.minute}'"
+            
+            embed.add_field(
+                name=f"{match.home} vs {match.away}",
+                value=match_info,
+                inline=False
+            )
+        
+        embed.set_footer(text="Real-time data from football-data.org")
+        await interaction.followup.send(embed=embed)
     
-    await interaction.followup.send(embed=embed)
-    logger.info(f'🏴󠁧󠁢󠁥󠁮󠁧󠁿 /epl used by {interaction.user}')
+    except Exception as e:
+        logger.error(f"Error in /epl: {e}")
+        await interaction.followup.send("❌ Failed to fetch EPL matches")
 
 @tree.command(name="ucl", description="Real Madrid/Barcelona in Champions League")
 async def ucl(interaction: discord.Interaction):
-    """UCL matches from shared state"""
     await interaction.response.defer()
     
-    target_teams = ['Real Madrid', 'Barcelona']
-    matches = match_engine.get_matches_by_league('ucl', target_teams)
-    
-    if not matches:
-        embed = discord.Embed(
-            title="ℹ️ No Matches",
-            description="আজ Real Madrid / Barcelona এর ম্যাচ নেই",
-            color=discord.Color.blue()
-        )
-        await interaction.followup.send(embed=embed)
+    if not football_api:
+        await interaction.followup.send("❌ API key not configured")
         return
     
-    embed = discord.Embed(
-        title="🏆 Champions League - Real Madrid / Barcelona",
-        color=discord.Color.gold(),
-        timestamp=datetime.utcnow()
-    )
-    
-    for match in matches:
-        status_emoji = {
-            MatchStatus.LIVE: '🔴',
-            MatchStatus.FULL_TIME: '⚪',
-            MatchStatus.SCHEDULED: '🕐'
-        }.get(match.status, '⚽')
-        
-        match_info = (
-            f"{status_emoji} **{match.home} {match.home_score} - {match.away_score} {match.away}**\n"
-            f"Status: {match.status.value} | Minute: {match.minute}'"
-        )
-        embed.add_field(
-            name=f"{match.home} vs {match.away}",
-            value=match_info,
-            inline=False
-        )
-    
-    await interaction.followup.send(embed=embed)
-    logger.info(f'🏆 /ucl used by {interaction.user}')
-
-# ============================================================================
-# BACKGROUND TASKS (UPDATE SHARED STATE)
-# ============================================================================
-
-@tasks.loop(seconds=30)
-async def match_updater():
-    """
-    Updates match state every 30 seconds:
-    - Advances minutes
-    - Adds goals realistically
-    - Transitions statuses
-    
-    Does NOT create new matches, only updates existing ones.
-    """
     try:
-        events = match_engine.update_matches()
+        matches = await football_api.get_target_team_matches('ucl')
         
-        if events:
-            logger.info(f"📊 Match update: {len(events)} events generated")
+        if not matches:
+            embed = discord.Embed(
+                title="ℹ️ No Matches",
+                description="আজ Real Madrid / Barcelona এর ম্যাচ নেই",
+                color=discord.Color.blue()
+            )
+            await interaction.followup.send(embed=embed)
+            return
         
+        embed = discord.Embed(
+            title="🏆 Champions League - Real Madrid / Barcelona",
+            color=discord.Color.gold(),
+            timestamp=datetime.utcnow()
+        )
+        
+        for match in matches:
+            status_emoji = {
+                'IN_PLAY': '🔴',
+                'LIVE': '🔴',
+                'FINISHED': '⚪',
+                'SCHEDULED': '🕐'
+            }.get(match.status, '⚽')
+            
+            match_info = (
+                f"{status_emoji} **{match.home} {match.home_score} - {match.away_score} {match.away}**\n"
+                f"Status: {match.status}"
+            )
+            
+            if match.minute > 0:
+                match_info += f" | {match.minute}'"
+            
+            embed.add_field(
+                name=f"{match.home} vs {match.away}",
+                value=match_info,
+                inline=False
+            )
+        
+        embed.set_footer(text="Real-time data from football-data.org")
+        await interaction.followup.send(embed=embed)
+    
     except Exception as e:
-        logger.error(f'❌ Match updater error: {e}')
+        logger.error(f"Error in /ucl: {e}")
+        await interaction.followup.send("❌ Failed to fetch UCL matches")
 
-@tasks.loop(seconds=35)
+# ============================================================================
+# BACKGROUND TASKS
+# ============================================================================
+
+@tasks.loop(seconds=60)
 async def match_monitor():
     """
-    Monitors for GOAL and FT events.
-    Reads from shared state updated by match_updater.
+    Monitor live matches every 60 seconds
+    Announce goals and full-time results
     """
     try:
-        # Get events from last update cycle
-        events = match_engine.update_matches()
-        
-        if not events:
+        if not football_api:
             return
+        
+        # Get all live matches
+        live_matches = await football_api.get_live_matches()
+        
+        # Also check target team matches for FT announcements
+        target_matches = []
+        for league in ['laliga', 'epl', 'ucl']:
+            matches = await football_api.get_target_team_matches(league)
+            target_matches.extend(matches)
+            await asyncio.sleep(0.5)
         
         # Find announcement channel
         channel = None
@@ -588,13 +552,14 @@ async def match_monitor():
                 break
         
         if not channel:
-            logger.warning('⚠️ No announcement channel found')
             return
         
-        # Process events
-        for match, event_type in events:
+        # Check for goals in live matches
+        for match in live_matches:
+            if not match.is_target_match():
+                continue
             
-            if event_type == 'GOAL':
+            if football_api.detect_goals(match):
                 embed = discord.Embed(
                     title="⚽ GOAL!",
                     description=f"**{match.home} {match.home_score} - {match.away_score} {match.away}**",
@@ -603,12 +568,14 @@ async def match_monitor():
                 )
                 embed.add_field(name="League", value=match.league.upper(), inline=True)
                 embed.add_field(name="Time", value=f"{match.minute}'", inline=True)
-                embed.set_footer(text=f"Today at {datetime.utcnow().strftime('%I:%M %p')}")
+                embed.set_footer(text="Real-time update")
                 
                 await channel.send(embed=embed)
                 logger.info(f'⚽ GOAL: {match.home} {match.home_score}-{match.away_score} {match.away}')
-            
-            elif event_type == 'FT':
+        
+        # Check for full-time
+        for match in target_matches:
+            if football_api.should_announce_ft(match):
                 embed = discord.Embed(
                     title="⚪ FULL TIME",
                     description=f"**{match.home} {match.home_score} - {match.away_score} {match.away}**",
@@ -620,22 +587,28 @@ async def match_monitor():
                 
                 await channel.send(embed=embed)
                 logger.info(f'⚪ FT: {match.home} {match.home_score}-{match.away_score} {match.away}')
-        
+    
     except Exception as e:
         logger.error(f'❌ Match monitor error: {e}')
-
-@match_updater.before_loop
-async def before_updater():
-    await client.wait_until_ready()
-    logger.info('✅ Match updater ready')
 
 @match_monitor.before_loop
 async def before_monitor():
     await client.wait_until_ready()
-    logger.info('✅ Match monitor ready')
+    logger.info('✅ Match monitor ready (60s interval)')
 
 # ============================================================================
-# MAIN EXECUTION
+# CLEANUP
+# ============================================================================
+
+@client.event
+async def on_close():
+    """Close API session on shutdown"""
+    if football_api:
+        await football_api.close()
+    logger.info('👋 Bot shutting down')
+
+# ============================================================================
+# MAIN
 # ============================================================================
 
 if __name__ == "__main__":
@@ -645,7 +618,12 @@ if __name__ == "__main__":
         logger.error('❌ DISCORD_TOKEN not set')
         exit(1)
     
-    logger.info('🚀 Starting Football Bot...')
+    if not FOOTBALL_API_KEY:
+        logger.error('❌ FOOTBALL_API_KEY not set')
+        logger.error('   Get one free at: https://www.football-data.org/client/register')
+        exit(1)
+    
+    logger.info('🚀 Starting Football Bot with real-time data...')
     
     try:
         client.run(token, log_handler=None)
