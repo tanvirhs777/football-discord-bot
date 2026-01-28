@@ -41,6 +41,16 @@ COMPETITIONS = {
 # ============================================================================
 # DATA MODELS
 # ============================================================================
+# DATA MODELS
+from datetime import datetime, timedelta, timezone
+
+def is_today_or_tomorrow(utc_date: str) -> bool:
+    try:
+        match_time = datetime.fromisoformat(utc_date.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        return now.date() <= match_time.date() <= (now + timedelta(days=1)).date()
+    except Exception:
+        return False
 
 @dataclass
 class Match:
@@ -294,6 +304,66 @@ async def on_ready():
 # ============================================================================
 # SLASH COMMANDS
 # ============================================================================
+@tree.command(name="upcoming", description="আজ ও আগামীকালের ম্যাচ দেখাও (Real Madrid / Barcelona)")
+async def upcoming(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    if not football_api:
+        await interaction.followup.send("❌ API key not configured")
+        return
+
+    upcoming_matches = []
+
+    try:
+        for league, code in COMPETITIONS.items():
+            matches = await football_api.get_matches_by_competition(code, status="SCHEDULED")
+
+            for match in matches:
+                if not match.is_target_match():
+                    continue
+                if not is_today_or_tomorrow(match.utc_date):
+                    continue
+
+                upcoming_matches.append(match)
+
+            await asyncio.sleep(0.4)
+
+        if not upcoming_matches:
+            embed = discord.Embed(
+                title="ℹ️ Upcoming Matches",
+                description="আজ বা আগামীকাল Real Madrid / Barcelona এর কোনো ম্যাচ নেই",
+                color=discord.Color.blue()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+
+        embed = discord.Embed(
+            title="📅 Upcoming Matches",
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+
+        for match in upcoming_matches:
+            kickoff = datetime.fromisoformat(
+                match.utc_date.replace('Z', '+00:00')
+            ).strftime('%d %b, %I:%M %p UTC')
+
+            embed.add_field(
+                name=f"{match.home} vs {match.away}",
+                value=(
+                    f"🏆 {match.league.upper()}\n"
+                    f"⏰ {kickoff}\n"
+                    f"📌 Status: Scheduled"
+                ),
+                inline=False
+            )
+
+        embed.set_footer(text="Source: football-data.org")
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        logger.error(f"/upcoming error: {e}")
+        await interaction.followup.send("❌ Upcoming matches আনতে সমস্যা হয়েছে")
 
 @tree.command(name="ping", description="Check bot status")
 async def ping(interaction: discord.Interaction):
