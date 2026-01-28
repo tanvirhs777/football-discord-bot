@@ -1,3 +1,4 @@
+
 # main.py
 # Discord Football Bot - Real-time data from football-data.org
 # Free tier: 10 requests/min, covers La Liga, EPL, UCL
@@ -44,13 +45,16 @@ COMPETITIONS = {
 # DATA MODELS
 from datetime import datetime, timedelta, timezone
 
-def is_today_or_tomorrow(utc_date: str) -> bool:
+def is_today_or_tomorrow_safe(utc_date: str) -> bool:
+    if not utc_date:
+        return False
     try:
         match_time = datetime.fromisoformat(utc_date.replace('Z', '+00:00'))
         now = datetime.now(timezone.utc)
         return now.date() <= match_time.date() <= (now + timedelta(days=1)).date()
     except Exception:
         return False
+
 
 @dataclass
 class Match:
@@ -316,12 +320,18 @@ async def upcoming(interaction: discord.Interaction):
 
     try:
         for league, code in COMPETITIONS.items():
-            matches = await football_api.get_matches_by_competition(code, status="SCHEDULED")
+            # ⚠️ status filter বাদ
+            matches = await football_api.get_matches_by_competition(code)
 
             for match in matches:
                 if not match.is_target_match():
                     continue
-                if not is_today_or_tomorrow(match.utc_date):
+
+                if not is_today_or_tomorrow_safe(match.utc_date):
+                    continue
+
+                # Only future / scheduled matches
+                if match.status not in ["SCHEDULED", "TIMED"]:
                     continue
 
                 upcoming_matches.append(match)
@@ -353,7 +363,7 @@ async def upcoming(interaction: discord.Interaction):
                 value=(
                     f"🏆 {match.league.upper()}\n"
                     f"⏰ {kickoff}\n"
-                    f"📌 Status: Scheduled"
+                    f"📌 Status: {match.status}"
                 ),
                 inline=False
             )
@@ -362,8 +372,9 @@ async def upcoming(interaction: discord.Interaction):
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        logger.error(f"/upcoming error: {e}")
+        logger.exception("❌ Upcoming command failed")
         await interaction.followup.send("❌ Upcoming matches আনতে সমস্যা হয়েছে")
+
 
 @tree.command(name="ping", description="Check bot status")
 async def ping(interaction: discord.Interaction):
