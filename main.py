@@ -6,7 +6,6 @@ import aiohttp
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, List
-import asyncio
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
