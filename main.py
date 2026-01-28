@@ -1,167 +1,198 @@
 import discord
 from discord import app_commands
+from discord.ext import tasks
 import aiohttp
 import os
-import asyncio
-from datetime import datetime, timedelta
-from dateutil import tz
+from datetime import datetime
+import pytz
 
 # ================= CONFIG =================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 API_KEY = os.getenv("API_FOOTBALL_KEY")
 BASE_URL = "https://v3.football.api-sports.io"
-
-BD_TZ = tz.gettz("Asia/Dhaka")
+BD_TZ = pytz.timezone("Asia/Dhaka")
 
 HEADERS = {
     "x-apisports-key": API_KEY
 }
 
-# ================= BOT =================
+# ================= BOT SETUP =================
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# ================= CACHE (ANTI-SPAM) =================
-last_scores = {}  # fixture_id -> (home, away)
+session: aiohttp.ClientSession | None = None
 
-# ================= HELPERS =================
+# Prevent goal spam
+last_scores = {}
+
+# ================= UTIL =================
 def bd_time(utc_str):
     utc = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
     return utc.astimezone(BD_TZ).strftime("%d %b %I:%M %p")
 
 async def api_get(endpoint, params=None):
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        async with session.get(f"{BASE_URL}/{endpoint}", params=params) as r:
-            if r.status != 200:
-                raise Exception("API Error")
-            return await r.json()
-
-def score_changed(fid, h, a):
-    old = last_scores.get(fid)
-    last_scores[fid] = (h, a)
-    return old is not None and old != (h, a)
+    async with session.get(f"{BASE_URL}/{endpoint}", headers=HEADERS, params=params) as r:
+        return await r.json()
 
 # ================= EVENTS =================
 @client.event
 async def on_ready():
+    global session
+    session = aiohttp.ClientSession()
     await tree.sync()
+    match_monitor.start()
     print(f"✅ Logged in as {client.user}")
 
 # ================= COMMANDS =================
 
-@tree.command(name="live", description="Show live football matches")
+@tree.command(name="ping")
+async def ping(i: discord.Interaction):
+    await i.response.send_message("🏓 Pong!")
+
+@tree.command(name="live", description="Show all live matches")
 async def live(i: discord.Interaction):
     await i.response.defer()
-    try:
-        data = await api_get("fixtures", {"live": "all"})
-        fixtures = data["response"]
+    data = await api_get("fixtures", {"live": "all"})
 
-        if not fixtures:
-            return await i.followup.send("❌ এখন কোনো লাইভ ম্যাচ নেই")
+    if not data["response"]:
+        await i.followup.send("❌ এখন কোনো লাইভ ম্যাচ নেই")
+        return
 
-        embed = discord.Embed(title="🔴 Live Matches", color=0xff0000)
+    embed = discord.Embed(title="🔴 Live Matches", color=discord.Color.red())
 
-        for f in fixtures[:10]:
-            h = f["teams"]["home"]["name"]
-            a = f["teams"]["away"]["name"]
-            hs = f["goals"]["home"]
-            as_ = f["goals"]["away"]
-            minute = f["fixture"]["status"]["elapsed"]
+    for m in data["response"][:10]:
+        f = m["fixture"]
+        t = m["teams"]
+        g = m["goals"]
+        embed.add_field(
+            name=f"{t['home']['name']} vs {t['away']['name']}",
+            value=f"**{g['home']} - {g['away']}** | ⏱ {f['status']['elapsed']}'",
+            inline=False
+        )
 
-            embed.add_field(
-                name=f"{h} vs {a}",
-                value=f"⚽ {hs} - {as_} | ⏱ {minute}'",
-                inline=False
-            )
-
-        await i.followup.send(embed=embed)
-
-    except:
-        await i.followup.send("❌ Live matches আনতে সমস্যা হয়েছে")
+    await i.followup.send(embed=embed)
 
 @tree.command(name="upcoming", description="Today & tomorrow matches")
 async def upcoming(i: discord.Interaction):
     await i.response.defer()
-    try:
-        today = datetime.utcnow().date()
-        tomorrow = today + timedelta(days=1)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
 
-        data = await api_get("fixtures", {
-            "from": today.isoformat(),
-            "to": tomorrow.isoformat()
-        })
+    data = await api_get("fixtures", {"date": today})
 
-        fixtures = data["response"]
+    if not data["response"]:
+        await i.followup.send("ℹ️ আজ/কাল কোনো ম্যাচ নেই")
+        return
 
-        if not fixtures:
-            return await i.followup.send("ℹ️ আজ/কাল কোনো ম্যাচ নেই")
+    embed = discord.Embed(title="📅 Upcoming Matches", color=discord.Color.blue())
 
-        embed = discord.Embed(title="📅 Upcoming Matches", color=0x3498db)
+    for m in data["response"][:10]:
+        f = m["fixture"]
+        t = m["teams"]
+        embed.add_field(
+            name=f"{t['home']['name']} vs {t['away']['name']}",
+            value=f"🕒 {bd_time(f['date'])}",
+            inline=False
+        )
 
-        for f in fixtures[:10]:
-            h = f["teams"]["home"]["name"]
-            a = f["teams"]["away"]["name"]
-            time = bd_time(f["fixture"]["date"])
-
-            embed.add_field(
-                name=f"{h} vs {a}",
-                value=f"🕒 {time}",
-                inline=False
-            )
-
-        await i.followup.send(embed=embed)
-
-    except:
-        await i.followup.send("❌ Upcoming matches আনতে সমস্যা হয়েছে")
+    await i.followup.send(embed=embed)
 
 @tree.command(name="league", description="Matches by league")
-@app_commands.describe(name="league name (epl, laliga, ucl etc)")
+@app_commands.describe(name="League name (epl, laliga, ucl etc)")
 async def league(i: discord.Interaction, name: str):
     await i.response.defer()
-    try:
-        data = await api_get("leagues", {"search": name})
-        league_id = data["response"][0]["league"]["id"]
+    leagues = await api_get("leagues", {"search": name})
 
-        data = await api_get("fixtures", {"league": league_id, "season": 2024})
-        fixtures = data["response"][:10]
+    if not leagues["response"]:
+        await i.followup.send("❌ League পাওয়া যায়নি")
+        return
 
-        embed = discord.Embed(title=f"🏆 {name.upper()}", color=0x9b59b6)
+    league_id = leagues["response"][0]["league"]["id"]
+    data = await api_get("fixtures", {"league": league_id, "season": datetime.utcnow().year})
 
-        for f in fixtures:
-            h = f["teams"]["home"]["name"]
-            a = f["teams"]["away"]["name"]
-            time = bd_time(f["fixture"]["date"])
-            embed.add_field(name=f"{h} vs {a}", value=time, inline=False)
+    if not data["response"]:
+        await i.followup.send("❌ কোনো ম্যাচ নেই")
+        return
 
-        await i.followup.send(embed=embed)
+    embed = discord.Embed(title=f"🏆 {name.upper()}", color=discord.Color.purple())
 
-    except:
-        await i.followup.send("❌ League data আনতে সমস্যা হয়েছে")
+    for m in data["response"][:10]:
+        t = m["teams"]
+        g = m["goals"]
+        embed.add_field(
+            name=f"{t['home']['name']} vs {t['away']['name']}",
+            value=f"{g['home']} - {g['away']}",
+            inline=False
+        )
 
-@tree.command(name="team", description="Matches by team")
-@app_commands.describe(name="team name")
+    await i.followup.send(embed=embed)
+
+@tree.command(name="team", description="Matches by team name")
+@app_commands.describe(name="Team name (Arsenal, Barcelona etc)")
 async def team(i: discord.Interaction, name: str):
     await i.response.defer()
-    try:
-        data = await api_get("teams", {"search": name})
-        team_id = data["response"][0]["team"]["id"]
+    teams = await api_get("teams", {"search": name})
 
-        data = await api_get("fixtures", {"team": team_id, "season": 2024})
-        fixtures = data["response"][:10]
+    if not teams["response"]:
+        await i.followup.send("❌ Team পাওয়া যায়নি")
+        return
 
-        embed = discord.Embed(title=f"👕 {name.title()}", color=0x2ecc71)
+    team_id = teams["response"][0]["team"]["id"]
+    data = await api_get("fixtures", {"team": team_id, "season": datetime.utcnow().year})
 
-        for f in fixtures:
-            h = f["teams"]["home"]["name"]
-            a = f["teams"]["away"]["name"]
-            time = bd_time(f["fixture"]["date"])
-            embed.add_field(name=f"{h} vs {a}", value=time, inline=False)
+    if not data["response"]:
+        await i.followup.send("❌ কোনো ম্যাচ নেই")
+        return
 
-        await i.followup.send(embed=embed)
+    embed = discord.Embed(title=f"⚽ {name}", color=discord.Color.green())
 
-    except:
-        await i.followup.send("❌ Team data আনতে সমস্যা হয়েছে")
+    for m in data["response"][:10]:
+        t = m["teams"]
+        g = m["goals"]
+        embed.add_field(
+            name=f"{t['home']['name']} vs {t['away']['name']}",
+            value=f"{g['home']} - {g['away']}",
+            inline=False
+        )
+
+    await i.followup.send(embed=embed)
+
+# ================= AUTO GOAL UPDATES =================
+@tasks.loop(seconds=60)
+async def match_monitor():
+    data = await api_get("fixtures", {"live": "all"})
+    if not data["response"]:
+        return
+
+    channel = None
+    for g in client.guilds:
+        for c in g.text_channels:
+            if c.permissions_for(g.me).send_messages:
+                channel = c
+                break
+        if channel:
+            break
+
+    if not channel:
+        return
+
+    for m in data["response"]:
+        f = m["fixture"]
+        t = m["teams"]
+        g = m["goals"]
+
+        key = f["id"]
+        score = f"{g['home']}-{g['away']}"
+
+        if last_scores.get(key) != score:
+            last_scores[key] = score
+            embed = discord.Embed(
+                title="⚽ GOAL!",
+                description=f"**{t['home']['name']} {score} {t['away']['name']}**",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Time", value=f"{f['status']['elapsed']}'")
+            await channel.send(embed=embed)
 
 # ================= RUN =================
 client.run(DISCORD_TOKEN)
