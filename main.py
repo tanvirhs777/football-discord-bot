@@ -1,140 +1,94 @@
 import discord
 from discord import app_commands
-from discord.ext import tasks
-import aiohttp
+import google.generativeai as genai
 import os
 import asyncio
-from datetime import datetime
-import pytz
+import textwrap
 
 # ================= CONFIG =================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-API_KEY = os.getenv("SPORTSAPI_KEY")
-BASE_URL = "https://api.sportsapipro.com/v1/football"
-TIMEZONE = pytz.timezone(os.getenv("TIMEZONE", "Asia/Dhaka"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-HEADERS = {
-    "Authorization": f"Bearer {API_KEY}",
-    "Accept": "application/json"
-}
+if not DISCORD_TOKEN or not GEMINI_API_KEY:
+    raise RuntimeError("❌ DISCORD_TOKEN or GEMINI_API_KEY missing")
 
-# ================= BOT CLASS =================
-class FootballBot(discord.Client):
-    def __init__(self):
-        super().__init__(intents=discord.Intents.default())
-        self.tree = app_commands.CommandTree(self)
-        self.session = None
-        self.last_goals = {}
+# ================= GEMINI SETUP =================
+genai.configure(api_key=GEMINI_API_KEY)
 
-    async def setup_hook(self):
-        # Initialize persistent session
-        self.session = aiohttp.ClientSession(headers=HEADERS)
-        self.goal_monitor.start()
+model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash"
+)
 
-    async def on_ready(self):
-        await self.tree.sync()
-        print(f"✅ Logged in as {self.user}")
+# ================= BOT SETUP =================
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
-    async def api_get(self, endpoint):
-        try:
-            async with self.session.get(f"{BASE_URL}{endpoint}") as r:
-                if r.status != 200:
-                    print(f"DEBUG: API Status {r.status} for {endpoint}")
-                    return None
-                return await r.json()
-        except Exception as e:
-            print(f"DEBUG: Connection Error: {e}")
-            return None
+# ================= HELPERS =================
 
-    def parse_matches(self, data):
-        if not data or "data" not in data:
-            return []
-        
-        parsed = []
-        for m in data["data"]:
-            try:
-                # SportsAPI Pro v1 uses home_team/away_team and scores objects
-                parsed.append({
-                    "id": str(m.get("id")),
-                    "home": m.get("home_team", {}).get("name", "Unknown"),
-                    "away": m.get("away_team", {}).get("name", "Unknown"),
-                    "hs": m.get("scores", {}).get("home_score", 0),
-                    "as": m.get("scores", {}).get("away_score", 0),
-                    "minute": m.get("time", {}).get("minute", 0),
-                    "status": m.get("status", "NS"),
-                    "start": m.get("starting_at")
-                })
-            except Exception as e:
-                print(f"DEBUG: Parse error: {e}")
-                continue
-        return parsed
+async def ask_gemini(prompt: str) -> str:
+    try:
+        full_prompt = (
+            "You are a football assistant.\n"
+            "Answer clearly for a Discord message.\n"
+            "Use emojis, short paragraphs, and bold team names.\n"
+            "Language: Bengali + English mix.\n\n"
+            f"Question: {prompt}"
+        )
 
-    @tasks.loop(seconds=60)
-    async def goal_monitor(self):
-        data = await self.api_get("/livescores")
-        matches = self.parse_matches(data)
-        if not matches: return
+        response = await asyncio.wait_for(
+            asyncio.to_thread(model.generate_content, full_prompt),
+            timeout=12
+        )
 
-        for guild in self.guilds:
-            channel = next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
-            if not channel: continue
+        text = response.text.strip()
 
-            for m in matches:
-                mid = m["id"]
-                score_str = f"{m['hs']}-{m['as']}"
-                
-                if mid in self.last_goals and self.last_goals[mid] != score_str:
-                    self.last_goals[mid] = score_str
-                    await channel.send(f"⚽ **GOAL!**\n**{m['home']} {m['hs']} - {m['as']} {m['away']}**\n⏱ {m['minute']}'")
-                else:
-                    self.last_goals[mid] = score_str
+        # Discord safety (2000 chars)
+        return textwrap.shorten(text, width=1800, placeholder="…")
 
-client = FootballBot()
+    except asyncio.TimeoutError:
+        return "⏳ Gemini একটু বেশি সময় নিচ্ছে, আবার চেষ্টা করো।"
+    except Exception as e:
+        print("Gemini error:", e)
+        return "❌ Gemini থেকে তথ্য আনতে সমস্যা হয়েছে।"
 
-# ================= UTILS =================
-def fmt_time(utc):
-    if not utc: return "TBD"
-    dt = datetime.fromisoformat(utc.replace("Z", "+00:00"))
-    return dt.astimezone(TIMEZONE).strftime("%d %b %I:%M %p")
+# ================= EVENTS =================
+
+@client.event
+async def on_ready():
+    await tree.sync()
+    print(f"✅ Gemini Football Bot online as {client.user}")
 
 # ================= COMMANDS =================
 
-@client.tree.command(name="live", description="Check live football scores")
+@tree.command(name="ping", description="Bot status check")
+async def ping(i: discord.Interaction):
+    await i.response.send_message("🏓 Pong! Gemini bot is online.")
+
+@tree.command(name="live", description="বর্তমান লাইভ ম্যাচ (AI summary)")
 async def live(i: discord.Interaction):
-    await i.response.defer() # Prevents "Application did not respond"
-    data = await client.api_get("/livescores")
-    matches = client.parse_matches(data)
-    
-    if not matches:
-        return await i.followup.send("❌ এখন কোনো লাইভ ম্যাচ নেই")
+    await i.response.defer()
+    answer = await ask_gemini(
+        "Give a summary of current live football matches in major leagues right now."
+    )
+    await i.followup.send(answer)
 
-    e = discord.Embed(title="🔴 Live Matches", color=0xff0000)
-    for m in matches:
-        e.add_field(
-            name=f"{m['home']} vs {m['away']}",
-            value=f"**{m['hs']} - {m['as']}** | ⏱ {m['minute']}'",
-            inline=False
-        )
-    await i.followup.send(embed=e)
-
-@client.tree.command(name="upcoming", description="Matches for today and tomorrow")
+@tree.command(name="upcoming", description="আজ ও আগামীকালের ম্যাচ")
 async def upcoming(i: discord.Interaction):
     await i.response.defer()
-    # SportsAPI Pro filter for today/tomorrow
-    data = await client.api_get("/fixtures?date=today,tomorrow")
-    matches = client.parse_matches(data)
-    
-    if not matches:
-        return await i.followup.send("ℹ️ আজ/কাল কোনো ম্যাচ নেই")
+    answer = await ask_gemini(
+        "List important football matches for today and tomorrow with Bangladesh time (GMT+6)."
+    )
+    await i.followup.send(answer)
 
-    e = discord.Embed(title="📅 Upcoming Matches", color=0x3498db)
-    for m in matches:
-        e.add_field(
-            name=f"{m['home']} vs {m['away']}",
-            value=f"🕒 {fmt_time(m['start'])}",
-            inline=False
-        )
-    await i.followup.send(embed=e)
+@tree.command(name="score", description="নির্দিষ্ট ম্যাচের স্কোর")
+@app_commands.describe(match="যেমন: Arsenal vs Chelsea")
+async def score(i: discord.Interaction, match: str):
+    await i.response.defer()
+    answer = await ask_gemini(
+        f"What is the latest known score or status of this match: {match}?"
+    )
+    await i.followup.send(answer)
 
 # ================= RUN =================
 client.run(DISCORD_TOKEN)
