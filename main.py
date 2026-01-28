@@ -1,11 +1,11 @@
 import os
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 import aiohttp
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Dict
+from typing import Dict, List
 import asyncio
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -35,7 +35,7 @@ intents.message_content = False
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-announced_goals: Dict[int, set] = {}
+team_cache: Dict[str, List[dict]] = {}
 
 
 async def api_request(session: aiohttp.ClientSession, endpoint: str, params: dict = None) -> dict:
@@ -52,6 +52,27 @@ async def api_request(session: aiohttp.ClientSession, endpoint: str, params: dic
     except Exception as e:
         print(f"API Error: {e}")
         return {"response": []}
+
+
+async def search_teams(query: str) -> List[app_commands.Choice[str]]:
+    if len(query) < 2:
+        return []
+    
+    cache_key = query.lower()
+    if cache_key in team_cache:
+        teams = team_cache[cache_key]
+    else:
+        async with aiohttp.ClientSession() as session:
+            data = await api_request(session, "teams", {"search": query})
+        teams = data.get("response", [])
+        team_cache[cache_key] = teams
+    
+    choices = []
+    for team in teams[:25]:
+        team_name = team["team"]["name"]
+        choices.append(app_commands.Choice(name=team_name, value=team_name))
+    
+    return choices
 
 
 def format_time_bd(utc_time_str: str) -> str:
@@ -104,31 +125,48 @@ def create_fixture_embed(fixture: dict, title: str) -> discord.Embed:
 async def on_ready():
     await tree.sync()
     print(f"✅ {bot.user} is ready!")
-    if not goal_tracker.is_running():
-        goal_tracker.start()
 
 
-@tree.command(name="live", description="Show currently live matches")
-async def live_matches(interaction: discord.Interaction):
+@tree.command(name="live", description="Show live match for a specific team")
+@app_commands.describe(team_name="Team name to check live match")
+@app_commands.autocomplete(team_name=search_teams)
+async def live_matches(interaction: discord.Interaction, team_name: str):
     await interaction.response.defer()
     
     async with aiohttp.ClientSession() as session:
-        data = await api_request(session, "fixtures", {"live": "all"})
+        search_data = await api_request(session, "teams", {"search": team_name})
     
-    fixtures = data.get("response", [])
+    teams = search_data.get("response", [])
     
-    if not fixtures:
+    if not teams:
         embed = discord.Embed(
-            title="⚽ Live Matches",
-            description="No live matches at the moment.",
+            title="❌ Team Not Found",
+            description=f"No team found matching '{team_name}'",
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed)
         return
     
+    team_id = teams[0]["team"]["id"]
+    team_full_name = teams[0]["team"]["name"]
+    
+    async with aiohttp.ClientSession() as session:
+        data = await api_request(session, "fixtures", {"live": "all", "team": team_id})
+    
+    fixtures = data.get("response", [])
+    
+    if not fixtures:
+        embed = discord.Embed(
+            title="⚽ No Live Match",
+            description=f"{team_full_name} is not playing right now.",
+            color=discord.Color.orange()
+        )
+        await interaction.followup.send(embed=embed)
+        return
+    
     embeds = []
-    for fixture in fixtures[:10]:
-        embed = create_fixture_embed(fixture, "⚽ LIVE MATCH")
+    for fixture in fixtures:
+        embed = create_fixture_embed(fixture, f"⚽ LIVE - {team_full_name}")
         embeds.append(embed)
     
     await interaction.followup.send(embeds=embeds[:10])
@@ -221,6 +259,7 @@ async def league_matches(interaction: discord.Interaction, league_name: str):
 
 @tree.command(name="team", description="Show fixtures for a specific team")
 @app_commands.describe(team_name="Team name to search")
+@app_commands.autocomplete(team_name=search_teams)
 async def team_fixtures(interaction: discord.Interaction, team_name: str):
     await interaction.response.defer()
     
@@ -264,73 +303,6 @@ async def team_fixtures(interaction: discord.Interaction, team_name: str):
         embeds.append(embed)
     
     await interaction.followup.send(embeds=embeds[:10])
-
-
-@tasks.loop(minutes=2)
-async def goal_tracker():
-    try:
-        async with aiohttp.ClientSession() as session:
-            data = await api_request(session, "fixtures", {"live": "all"})
-        
-        fixtures = data.get("response", [])
-        
-        for fixture in fixtures:
-            fixture_id = fixture["fixture"]["id"]
-            home_goals = fixture["goals"]["home"] or 0
-            away_goals = fixture["goals"]["away"] or 0
-            total_goals = home_goals + away_goals
-            
-            if fixture_id not in announced_goals:
-                announced_goals[fixture_id] = set()
-            
-            current_goals = announced_goals[fixture_id]
-            
-            if total_goals > len(current_goals):
-                async with aiohttp.ClientSession() as session:
-                    events_data = await api_request(session, "fixtures/events", {"fixture": fixture_id})
-                
-                events = events_data.get("response", [])
-                goal_events = [e for e in events if e["type"] == "Goal" and e["detail"] != "Missed Penalty"]
-                
-                for event in goal_events:
-                    event_key = f"{event['time']['elapsed']}_{event['team']['name']}_{event['player']['name']}"
-                    
-                    if event_key not in current_goals:
-                        current_goals.add(event_key)
-                        
-                        home = fixture["teams"]["home"]["name"]
-                        away = fixture["teams"]["away"]["name"]
-                        scorer = event["player"]["name"]
-                        minute = event["time"]["elapsed"]
-                        team = event["team"]["name"]
-                        
-                        embed = discord.Embed(
-                            title="⚽ GOAL!",
-                            description=f"**{scorer}** scores for **{team}**!",
-                            color=discord.Color.gold()
-                        )
-                        embed.add_field(
-                            name="Match",
-                            value=f"{home} {home_goals} - {away_goals} {away}",
-                            inline=False
-                        )
-                        embed.add_field(name="Time", value=f"{minute}'", inline=True)
-                        
-                        for guild in bot.guilds:
-                            for channel in guild.text_channels:
-                                if channel.permissions_for(guild.me).send_messages:
-                                    try:
-                                        await channel.send(embed=embed)
-                                        break
-                                    except:
-                                        continue
-    except Exception as e:
-        print(f"Goal tracker error: {e}")
-
-
-@goal_tracker.before_loop
-async def before_goal_tracker():
-    await bot.wait_until_ready()
 
 
 bot.run(DISCORD_TOKEN)
