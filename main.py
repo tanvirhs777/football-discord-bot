@@ -133,7 +133,8 @@ def create_fixture_embed(fixture: dict, title: str) -> discord.Embed:
 @bot.event
 async def on_ready():
     await tree.sync()
-    print(f"✅ {bot.user} is ready!")
+    print(f"✅ Bot ready! No automatic messages will be sent.")
+    print(f"Logged in as: {bot.user}")
 
 
 @tree.command(name="live", description="Show live match for a specific team")
