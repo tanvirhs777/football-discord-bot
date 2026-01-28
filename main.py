@@ -1,258 +1,147 @@
-# =========================
-# Discord Football Bot
-# SportsAPI Pro – Final
-# =========================
-
 import discord
 from discord import app_commands
 from discord.ext import tasks
-import os
 import aiohttp
+import os
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 
-# =========================
-# CONFIG
-# =========================
-
+# ================= CONFIG =================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-SPORTS_API_KEY = os.getenv("SPORTS_API_KEY")
-
-API_BASE = "https://api.sportsapipro.com/v1/football"
-BD_TZ = pytz.timezone("Asia/Dhaka")
+API_KEY = os.getenv("SPORTSAPI_KEY")
+# Ensure there is NO trailing slash here
+BASE_URL = "https://api.sportsapipro.com/v1/football"
+TIMEZONE = pytz.timezone(os.getenv("TIMEZONE", "Asia/Dhaka"))
 
 HEADERS = {
-    "Authorization": f"Bearer {SPORTS_API_KEY}",
+    "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json"
 }
 
-# =========================
-# DISCORD SETUP
-# =========================
+# Spam control
+LAST_GOALS = {}
 
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+# ================= BOT CLASS =================
+class FootballBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=discord.Intents.default())
+        self.tree = app_commands.CommandTree(self)
+        self.session = None
 
-# =========================
-# GLOBAL STATE (ANTI-SPAM)
-# =========================
+    async def setup_hook(self):
+        # Initialize the session once when the bot starts
+        self.session = aiohttp.ClientSession(headers=HEADERS)
+        self.goal_monitor.start()
 
-last_scores = {}      # match_id -> (home, away)
-announced_ft = set()
+    async def on_ready(self):
+        await self.tree.sync()
+        print(f"✅ {self.user} is online")
 
-# =========================
-# UTILS
-# =========================
+    # Move the monitor inside the class for better session access
+    @tasks.loop(seconds=60)
+    async def goal_monitor(self):
+        data = await self.api_get("/livescores")
+        if not data: return
 
-def bd_time(utc_str: str) -> str:
-    try:
-        utc = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
-        return utc.astimezone(BD_TZ).strftime("%d %b %I:%M %p")
-    except:
-        return "N/A"
+        matches = self.parse_matches(data)
+        # Broadcast logic: you can refine this to a specific channel ID
+        for guild in self.guilds:
+            channel = next((c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
+            if not channel: continue
 
-async def api_get(endpoint: str, params: dict = None):
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        async with session.get(f"{API_BASE}/{endpoint}", params=params) as r:
-            if r.status != 200:
-                raise Exception(f"API Error {r.status}")
-            return await r.json()
+            for m in matches:
+                key = m["id"]
+                score = f"{m['hs']}-{m['as']}"
+                
+                if LAST_GOALS.get(key) and LAST_GOALS.get(key) != score:
+                    LAST_GOALS[key] = score
+                    await channel.send(f"⚽ **GOAL!**\n**{m['home']} {m['hs']} - {m['as']} {m['away']}**\n⏱ {m['minute']}'")
+                elif not LAST_GOALS.get(key):
+                    LAST_GOALS[key] = score
 
-def parse_matches(data):
-    matches = data.get("data", [])
-    parsed = []
+    async def api_get(self, endpoint):
+        try:
+            async with self.session.get(f"{BASE_URL}{endpoint}") as r:
+                if r.status != 200:
+                    print(f"API Error: {r.status}")
+                    return None
+                return await r.json()
+        except Exception as e:
+            print(f"Connection Error: {e}")
+            return None
 
-    for m in matches:
-        parsed.append({
-            "id": str(m["id"]),
-            "league": m.get("league", {}).get("name", "Unknown"),
-            "home": m["home_team"]["name"],
-            "away": m["away_team"]["name"],
-            "home_score": m["scores"]["home_score"],
-            "away_score": m["scores"]["away_score"],
-            "status": m["status"].upper(),
-            "minute": m.get("time", 0),
-            "start": m.get("starting_at")
-        })
-    return parsed
+    def parse_matches(self, data):
+        # Most SportsAPIs wrap their response in a 'data' or 'items' key
+        items = data.get("data", []) if isinstance(data, dict) else []
+        parsed = []
+        for m in items:
+            try:
+                parsed.append({
+                    "id": str(m.get("id")),
+                    # Handling different possible key names for team names
+                    "home": m.get("home_team", {}).get("name") or m.get("home", {}).get("name") or "Unknown",
+                    "away": m.get("away_team", {}).get("name") or m.get("away", {}).get("name") or "Unknown",
+                    "hs": m.get("scores", {}).get("home_score", 0),
+                    "as": m.get("scores", {}).get("away_score", 0),
+                    "minute": m.get("time", {}).get("minute", 0),
+                    "state": m.get("status", "NS"),
+                    "start": m.get("starting_at")
+                })
+            except Exception as e:
+                print(f"Parsing error for match: {e}")
+                continue
+        return parsed
 
-# =========================
-# BOT EVENTS
-# =========================
+client = FootballBot()
 
-@client.event
-async def on_ready():
-    for g in client.guilds:
-        tree.copy_global_to(guild=g)
-        await tree.sync(guild=g)
-    match_monitor.start()
-    print("✅ Bot online & synced")
+# ================= COMMANDS =================
 
-# =========================
-# SLASH COMMANDS
-# =========================
-
-@tree.command(name="ping")
-async def ping(i: discord.Interaction):
-    await i.response.send_message("🏓 Pong! Bot is alive")
-
-# ---------- LIVE ----------
-@tree.command(name="live")
+@client.tree.command(name="live", description="সব লাইভ ম্যাচের আপডেট")
 async def live(i: discord.Interaction):
     await i.response.defer()
-    try:
-        raw = await api_get("matches/live")
-        matches = parse_matches(raw)
+    data = await client.api_get("/livescores")
+    matches = client.parse_matches(data)
+    
+    if not matches:
+        await i.followup.send("❌ এখন কোনো লাইভ ম্যাচ নেই")
+        return
 
-        if not matches:
-            await i.followup.send("❌ এখন কোনো লাইভ ম্যাচ নেই")
-            return
+    e = discord.Embed(title="🔴 Live Matches", color=0xff0000)
+    for m in matches:
+        e.add_field(
+            name=f"{m['home']} vs {m['away']}",
+            value=f"Score: **{m['hs']} - {m['as']}** | ⏱ {m['minute']}'",
+            inline=False
+        )
+    await i.followup.send(embed=e)
 
-        e = discord.Embed(title="🔴 Live Matches", color=discord.Color.red())
-        for m in matches:
-            e.add_field(
-                name=m["league"],
-                value=f"**{m['home']} {m['home_score']} - {m['away_score']} {m['away']}**\n⏱ {m['minute']}'",
-                inline=False
-            )
-        await i.followup.send(embed=e)
+# Simple helper for time formatting
+def fmt_time(utc):
+    if not utc: return "TBD"
+    dt = datetime.fromisoformat(utc.replace("Z", "+00:00"))
+    return dt.astimezone(TIMEZONE).strftime("%d %b %I:%M %p")
 
-    except Exception as ex:
-        print(ex)
-        await i.followup.send("❌ Live matches আনতে সমস্যা হয়েছে")
-
-# ---------- UPCOMING ----------
-@tree.command(name="upcoming")
+@client.tree.command(name="upcoming", description="আজ ও আগামীকালের ম্যাচ")
 async def upcoming(i: discord.Interaction):
     await i.response.defer()
-    try:
-        today = datetime.utcnow().date()
-        tomorrow = today + timedelta(days=1)
+    # Check if your API uses /fixtures or /matches
+    data = await client.api_get("/fixtures?date=today,tomorrow")
+    matches = client.parse_matches(data)
+    
+    if not matches:
+        await i.followup.send("ℹ️ আজ/কাল কোনো ম্যাচ নেই")
+        return
 
-        raw = await api_get("matches", {
-            "from": today.isoformat(),
-            "to": tomorrow.isoformat()
-        })
+    e = discord.Embed(title="📅 Upcoming Matches", color=0x3498db)
+    for m in matches:
+        e.add_field(
+            name=f"{m['home']} vs {m['away']}",
+            value=f"🕒 {fmt_time(m['start'])}",
+            inline=False
+        )
+    await i.followup.send(embed=e)
 
-        matches = parse_matches(raw)
-
-        if not matches:
-            await i.followup.send("ℹ️ আজ/কাল কোনো ম্যাচ নেই")
-            return
-
-        e = discord.Embed(title="📅 Upcoming Matches", color=discord.Color.blue())
-        for m in matches:
-            e.add_field(
-                name=m["league"],
-                value=f"**{m['home']} vs {m['away']}**\n🕒 {bd_time(m['start'])}",
-                inline=False
-            )
-        await i.followup.send(embed=e)
-
-    except Exception as ex:
-        print(ex)
-        await i.followup.send("❌ Upcoming matches আনতে সমস্যা হয়েছে")
-
-# ---------- LEAGUE ----------
-@tree.command(name="league")
-async def league(i: discord.Interaction, name: str):
-    await i.response.defer()
-    try:
-        raw = await api_get("matches", {"league": name})
-        matches = parse_matches(raw)
-
-        if not matches:
-            await i.followup.send("ℹ️ এই league এ কোনো ম্যাচ নেই")
-            return
-
-        e = discord.Embed(title=f"🏆 {name.upper()}", color=discord.Color.green())
-        for m in matches:
-            e.add_field(
-                name=m["league"],
-                value=f"{m['home']} {m['home_score']} - {m['away_score']} {m['away']}",
-                inline=False
-            )
-        await i.followup.send(embed=e)
-
-    except Exception as ex:
-        print(ex)
-        await i.followup.send("❌ League data আনতে সমস্যা হয়েছে")
-
-# ---------- TEAM ----------
-@tree.command(name="team")
-async def team(i: discord.Interaction, name: str):
-    await i.response.defer()
-    try:
-        raw = await api_get("matches", {"team": name})
-        matches = parse_matches(raw)
-
-        if not matches:
-            await i.followup.send("ℹ️ এই দলের কোনো ম্যাচ নেই")
-            return
-
-        e = discord.Embed(title=f"👕 {name}", color=discord.Color.orange())
-        for m in matches:
-            e.add_field(
-                name=m["league"],
-                value=f"{m['home']} {m['home_score']} - {m['away_score']} {m['away']}",
-                inline=False
-            )
-        await i.followup.send(embed=e)
-
-    except Exception as ex:
-        print(ex)
-        await i.followup.send("❌ Team data আনতে সমস্যা হয়েছে")
-
-# =========================
-# BACKGROUND GOAL MONITOR
-# =========================
-
-@tasks.loop(seconds=60)
-async def match_monitor():
-    try:
-        raw = await api_get("matches/live")
-        matches = parse_matches(raw)
-
-        channel = None
-        for g in client.guilds:
-            for c in g.text_channels:
-                if c.permissions_for(g.me).send_messages:
-                    channel = c
-                    break
-            if channel:
-                break
-
-        if not channel:
-            return
-
-        for m in matches:
-            mid = m["id"]
-            score = (m["home_score"], m["away_score"])
-
-            if mid not in last_scores:
-                last_scores[mid] = score
-                continue
-
-            if score != last_scores[mid]:
-                last_scores[mid] = score
-
-                e = discord.Embed(
-                    title="⚽ GOAL!",
-                    description=f"**{m['home']} {score[0]} - {score[1]} {m['away']}**",
-                    color=discord.Color.green()
-                )
-                await channel.send(embed=e)
-
-    except Exception as e:
-        print("Monitor error:", e)
-
-# =========================
-# RUN
-# =========================
-
-if not DISCORD_TOKEN or not SPORTS_API_KEY:
-    raise RuntimeError("❌ Missing ENV variables")
-
-client.run(DISCORD_TOKEN)
+# ================= RUN =================
+if __name__ == "__main__":
+    client.run(DISCORD_TOKEN)
