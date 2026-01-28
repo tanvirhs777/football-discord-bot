@@ -19,9 +19,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger('football_bot')
 
-# Bot setup
+# Bot setup with minimal intents
 intents = discord.Intents.default()
-intents.message_content = False  # Not using message intents
+intents.message_content = False
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -29,33 +29,39 @@ tree = app_commands.CommandTree(client)
 active_matches = {}
 announced_goals = {}
 announced_ft = set()
+last_match_state = {}
 
-# Mock match data generator
+# Mock match data - simulates real matches
 def generate_mock_matches():
     """Generate realistic mock match data"""
     teams = {
-        'laliga': ['Real Madrid', 'Barcelona', 'Atletico Madrid', 'Sevilla', 'Real Betis'],
+        'laliga': ['Real Madrid', 'Barcelona', 'Atletico Madrid', 'Sevilla', 'Real Betis', 'Valencia'],
         'epl': ['Manchester City', 'Arsenal', 'Liverpool', 'Chelsea', 'Manchester United'],
-        'ucl': ['Real Madrid', 'Barcelona', 'Bayern Munich', 'PSG', 'Manchester City']
+        'ucl': ['Real Madrid', 'Barcelona', 'Bayern Munich', 'PSG', 'Manchester City', 'Inter Milan']
     }
     
     matches = []
     now = datetime.utcnow()
     
-    # Generate 1-2 matches per league with Real Madrid or Barcelona sometimes
+    # Generate matches with Real Madrid or Barcelona
     for league in ['laliga', 'epl', 'ucl']:
-        if random.random() > 0.5:  # 50% chance of match
+        if random.random() > 0.4:  # 60% chance of match
             team_pool = teams[league].copy()
             
             # Higher chance for Real Madrid/Barcelona in LaLiga and UCL
             if league in ['laliga', 'ucl'] and random.random() > 0.3:
                 home = random.choice(['Real Madrid', 'Barcelona'])
-                team_pool.remove(home)
+                if home in team_pool:
+                    team_pool.remove(home)
                 away = random.choice(team_pool)
             else:
                 home = random.choice(team_pool)
-                team_pool.remove(home)
-                away = random.choice(team_pool)
+                if home in team_pool:
+                    team_pool.remove(home)
+                if team_pool:
+                    away = random.choice(team_pool)
+                else:
+                    away = 'Opponent'
             
             # Random match state
             status = random.choice(['LIVE', 'LIVE', 'FT', 'SCH'])
@@ -68,11 +74,10 @@ def generate_mock_matches():
                 minute = 90
                 home_score = random.randint(0, 4)
                 away_score = random.randint(0, 4)
-            else:  # Scheduled
+            else:
                 minute = 0
                 home_score = 0
                 away_score = 0
-                now = now + timedelta(hours=random.randint(1, 5))
             
             match_id = f"{league}_{home}_{away}".replace(' ', '_')
             
@@ -119,20 +124,23 @@ def has_target_team(match):
 @client.event
 async def on_ready():
     """Bot startup"""
-    await tree.sync()
-    logger.info(f'✅ Logged in as {client.user}')
-    logger.info(f'✅ Bot is ready and slash commands are synced')
-    
-    # Start background tasks
-    if not match_monitor.is_running():
-        match_monitor.start()
-    if not match_updater.is_running():
-        match_updater.start()
+    try:
+        synced = await tree.sync()
+        logger.info(f'✅ Logged in as {client.user}')
+        logger.info(f'✅ Synced {len(synced)} slash command(s)')
+        
+        # Start background tasks
+        if not match_monitor.is_running():
+            match_monitor.start()
+        if not match_updater.is_running():
+            match_updater.start()
+    except Exception as e:
+        logger.error(f'Error in on_ready: {e}')
 
 @tree.command(name="ping", description="Check if bot is alive")
 async def ping(interaction: discord.Interaction):
     """Simple ping command"""
-    await interaction.response.send_message("🏓 Pong!")
+    await interaction.response.send_message("🏓 Pong!", ephemeral=False)
     logger.info(f'Ping command used by {interaction.user}')
 
 @tree.command(name="live", description="Show all live football matches")
@@ -161,6 +169,7 @@ async def live(interaction: discord.Interaction):
             inline=False
         )
     
+    embed.set_footer(text="Football Bot")
     await interaction.followup.send(embed=embed)
     logger.info(f'Live command used by {interaction.user}')
 
@@ -189,6 +198,7 @@ async def laliga(interaction: discord.Interaction):
             inline=False
         )
     
+    embed.set_footer(text="Football Bot")
     await interaction.followup.send(embed=embed)
     logger.info(f'LaLiga command used by {interaction.user}')
 
@@ -217,6 +227,7 @@ async def epl(interaction: discord.Interaction):
             inline=False
         )
     
+    embed.set_footer(text="Football Bot")
     await interaction.followup.send(embed=embed)
     logger.info(f'EPL command used by {interaction.user}')
 
@@ -245,46 +256,51 @@ async def ucl(interaction: discord.Interaction):
             inline=False
         )
     
+    embed.set_footer(text="Football Bot")
     await interaction.followup.send(embed=embed)
     logger.info(f'UCL command used by {interaction.user}')
 
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=3)
 async def match_updater():
     """Update match data periodically"""
     try:
-        global active_matches
+        global active_matches, last_match_state
         matches = generate_mock_matches()
         
-        # Update active matches
         for match in matches:
             if match['status'] == 'LIVE' and has_target_team(match):
+                # Store previous state
+                if match['id'] in active_matches:
+                    last_match_state[match['id']] = active_matches[match['id']].copy()
                 active_matches[match['id']] = match
             elif match['id'] in active_matches and match['status'] == 'FT':
+                last_match_state[match['id']] = active_matches[match['id']].copy()
                 active_matches[match['id']] = match
         
-        # Remove old finished matches
+        # Clean up old matches
         to_remove = []
         for match_id, match in active_matches.items():
             if match['status'] == 'FT' and match_id in announced_ft:
+                # Keep for 10 minutes after FT
                 to_remove.append(match_id)
         
         for match_id in to_remove:
-            del active_matches[match_id]
+            if match_id in active_matches:
+                del active_matches[match_id]
+            if match_id in last_match_state:
+                del last_match_state[match_id]
             
     except Exception as e:
         logger.error(f'Error in match updater: {e}')
 
-@tasks.loop(seconds=30)
+@tasks.loop(seconds=45)
 async def match_monitor():
-    """Monitor matches and send goal/FT updates"""
+    """Monitor matches and send goal/FT updates to channel where command was used"""
     try:
         if not active_matches:
             return
         
-        # Get first text channel in first guild (for demo purposes)
-        if not client.guilds:
-            return
-        
+        # Get first available text channel
         channel = None
         for guild in client.guilds:
             for ch in guild.text_channels:
@@ -298,24 +314,27 @@ async def match_monitor():
             return
         
         for match_id, match in list(active_matches.items()):
-            # Goal updates
+            # Goal updates - only if score changed
             if match['status'] == 'LIVE':
-                score_key = f"{match_id}_{match['home_score']}_{match['away_score']}"
-                
-                if score_key not in announced_goals:
-                    total_goals = match['home_score'] + match['away_score']
-                    if total_goals > 0:
+                # Check if score changed
+                old_match = last_match_state.get(match_id)
+                if old_match:
+                    old_total = old_match['home_score'] + old_match['away_score']
+                    new_total = match['home_score'] + match['away_score']
+                    
+                    # New goal scored
+                    if new_total > old_total:
                         embed = discord.Embed(
                             title="⚽ GOAL!",
                             description=f"**{match['home']} {match['home_score']} - {match['away_score']} {match['away']}**",
                             color=discord.Color.green(),
                             timestamp=datetime.utcnow()
                         )
-                        embed.add_field(name="League", value=match['league'].upper())
-                        embed.add_field(name="Time", value=f"{match['minute']}'")
+                        embed.add_field(name="League", value=match['league'].upper(), inline=True)
+                        embed.add_field(name="Time", value=f"{match['minute']}'", inline=True)
+                        embed.set_footer(text=f"Today at {datetime.utcnow().strftime('%I:%M %p')}")
                         
                         await channel.send(embed=embed)
-                        announced_goals[score_key] = True
                         logger.info(f'Goal announced: {match["home"]} {match["home_score"]}-{match["away_score"]} {match["away"]}')
             
             # Full-time updates
@@ -326,7 +345,8 @@ async def match_monitor():
                     color=discord.Color.blue(),
                     timestamp=datetime.utcnow()
                 )
-                embed.add_field(name="League", value=match['league'].upper())
+                embed.add_field(name="League", value=match['league'].upper(), inline=True)
+                embed.set_footer(text="Match Ended")
                 
                 await channel.send(embed=embed)
                 announced_ft.add(match_id)
@@ -338,10 +358,12 @@ async def match_monitor():
 @match_updater.before_loop
 async def before_updater():
     await client.wait_until_ready()
+    logger.info('Match updater started')
 
 @match_monitor.before_loop
 async def before_monitor():
     await client.wait_until_ready()
+    logger.info('Match monitor started')
 
 # Run bot
 if __name__ == "__main__":
@@ -352,7 +374,9 @@ if __name__ == "__main__":
         exit(1)
     
     try:
-        client.run(token)
+        client.run(token, log_handler=None)
+    except KeyboardInterrupt:
+        logger.info('Bot stopped by user')
     except Exception as e:
         logger.error(f'❌ Failed to start bot: {e}')
         exit(1)
