@@ -11,11 +11,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not DISCORD_TOKEN or not GEMINI_API_KEY:
     raise RuntimeError("DISCORD_TOKEN or GEMINI_API_KEY missing")
 
-# Gemini setup (টুলস যোগ করা হয়েছে রিয়েল-টাইম ডেটার জন্য)
+# Gemini setup (Google Search Tool এনাবল করা হয়েছে)
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(
     model_name="gemini-1.5-flash",
-    tools=[{"google_search_retrieval": {}}] # এটি ইন্টারনেটে সার্চ করতে সাহায্য করবে
+    tools=[{"google_search_retrieval": {}}] # এটি রিয়েল-টাইম ডেটার জন্য অত্যন্ত জরুরি
 )
 
 # ================= BOT SETUP =================
@@ -25,19 +25,13 @@ tree = app_commands.CommandTree(client)
 
 async def ask_gemini(prompt: str) -> str:
     try:
-        # প্রম্পটে একটু তথ্য যোগ করে দেওয়া যাতে সে ইন্টারনেটে খুঁজে দেখে
-        full_prompt = f"Using Google Search, provide the most current and real-time info: {prompt}"
-        
-        response = await asyncio.to_thread(
-            model.generate_content,
-            full_prompt
-        )
+        # জেমিনিকে ইন্টারনেটে সার্চ করে উত্তর দিতে বলা হচ্ছে
+        full_prompt = f"Provide the most current and real-time info using Google Search: {prompt}"
+        response = await asyncio.to_thread(model.generate_content, full_prompt)
         return response.text.strip()
     except Exception as e:
         print("Gemini error:", e)
         return "❌ Gemini থেকে তথ্য আনতে সমস্যা হয়েছে। পরে আবার চেষ্টা করো।"
-
-# 
 
 # ================= EVENTS =================
 @client.event
@@ -47,35 +41,38 @@ async def on_ready():
 
 # ================= COMMANDS =================
 
-@tree.command(name="ping", description="বট ঠিক আছে কি না চেক করার জন্য")
-async def ping(i: discord.Interaction):
-    await i.response.send_message("🏓 Pong! Gemini bot online ✅")
-
-@tree.command(name="live", description="বর্তমান লাইভ ম্যাচ (Real-time summary)")
+@tree.command(name="live", description="বর্তমান লাইভ ম্যাচ (Google Search দ্বারা)")
 async def live(i: discord.Interaction):
-    await i.response.defer()
+    # ডিসকর্ড ৩ সেকেন্ডের বেশি সময় নিলে 'Application did not respond' দেখায়। 
+    # তাই আমরা defer() ব্যবহার করছি যাতে বট ভাবার সময় পায়।
+    await i.response.defer() 
+    
     prompt = (
-        "Check current live football matches (Premier League, La Liga, UCL, etc.) right now. "
-        "List them in bullet points with scores and current minute."
+        "Search for major live football matches happening right now. "
+        "Include scores, current minute, and league names. "
+        "Reply in concise bullet points with emojis."
     )
     answer = await ask_gemini(prompt)
-    await i.followup.send(answer)
+    await i.followup.send(answer) # defer এর পর followup.send ব্যবহার করতে হয়
 
 @tree.command(name="upcoming", description="আজ ও কালকের ম্যাচের সময়সূচী")
 async def upcoming(i: discord.Interaction):
     await i.response.defer()
+    
     prompt = (
-        "Search for major football matches today and tomorrow. "
-        "Convert all kick-off times to Bangladesh Standard Time (BST/GMT+6)."
+        "Search for important football fixtures for today and tomorrow. "
+        "Convert kick-off times to Bangladesh Standard Time (BST/GMT+6). "
+        "Use a clean list format."
     )
     answer = await ask_gemini(prompt)
     await i.followup.send(answer)
 
-@tree.command(name="score", description="নির্দিষ্ট ম্যাচের একদম লেটেস্ট স্কোর")
-@app_commands.describe(match="যেমন: Real Madrid vs Barcelona")
+@tree.command(name="score", description="নির্দিষ্ট ম্যাচের স্কোর চেক করুন")
+@app_commands.describe(match="উদাহরণ: Arsenal vs Man City")
 async def score(i: discord.Interaction, match: str):
     await i.response.defer()
-    prompt = f"Search for the latest live score and key events of {match}."
+    
+    prompt = f"Find the latest live score and goal scorers for the match: {match}."
     answer = await ask_gemini(prompt)
     await i.followup.send(answer)
 
