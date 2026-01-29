@@ -125,7 +125,8 @@ def create_fixture_embed(fixture: dict, title: str) -> discord.Embed:
     )
     
     league_name = fixture["league"]["name"]
-    embed.set_footer(text=f"{league_name} • ID: {fixture['fixture']['id']}")
+    match_date = format_time_bd(fixture["fixture"]["date"])
+    embed.set_footer(text=f"{league_name} • {match_date}")
     
     return embed
 
@@ -191,10 +192,112 @@ async def live_matches(interaction: discord.Interaction, team_name: str):
     await interaction.followup.send(embeds=embeds[:10])
 
 
-@tree.command(name="upcoming", description="Show upcoming matches (today + tomorrow)")
-async def upcoming_matches(interaction: discord.Interaction):
+@tree.command(name="last", description="Show the last match result for a specific team")
+@app_commands.describe(team_name="Team name to check last match")
+@app_commands.autocomplete(team_name=team_autocomplete)
+async def last_match(interaction: discord.Interaction, team_name: str):
     await interaction.response.defer()
     
+    if team_name == "none":
+        embed = discord.Embed(
+            title="❌ Invalid Selection",
+            description="Please type a valid team name.",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+        return
+    
+    async with aiohttp.ClientSession() as session:
+        search_data = await api_request(session, "teams", {"search": team_name})
+    
+    teams = search_data.get("response", [])
+    
+    if not teams:
+        embed = discord.Embed(
+            title="❌ Team Not Found",
+            description=f"No team found matching '{team_name}'",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+        return
+    
+    team_id = teams[0]["team"]["id"]
+    team_full_name = teams[0]["team"]["name"]
+    
+    async with aiohttp.ClientSession() as session:
+        data = await api_request(session, "fixtures", {
+            "team": team_id,
+            "last": 1
+        })
+    
+    fixtures = data.get("response", [])
+    
+    if not fixtures:
+        embed = discord.Embed(
+            title="❌ No Recent Match",
+            description=f"No recent match found for {team_full_name}",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+        return
+    
+    fixture = fixtures[0]
+    embed = create_fixture_embed(fixture, f"📊 Last Match - {team_full_name}")
+    
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="upcoming", description="Show upcoming matches for a team or all matches (today + tomorrow)")
+@app_commands.describe(team_name="Team name (optional - leave empty for all matches)")
+@app_commands.autocomplete(team_name=team_autocomplete)
+async def upcoming_matches(interaction: discord.Interaction, team_name: str = None):
+    await interaction.response.defer()
+    
+    # If team name is provided
+    if team_name and team_name != "none":
+        async with aiohttp.ClientSession() as session:
+            search_data = await api_request(session, "teams", {"search": team_name})
+        
+        teams = search_data.get("response", [])
+        
+        if not teams:
+            embed = discord.Embed(
+                title="❌ Team Not Found",
+                description=f"No team found matching '{team_name}'",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        team_id = teams[0]["team"]["id"]
+        team_full_name = teams[0]["team"]["name"]
+        
+        async with aiohttp.ClientSession() as session:
+            data = await api_request(session, "fixtures", {
+                "team": team_id,
+                "next": 5
+            })
+        
+        fixtures = data.get("response", [])
+        
+        if not fixtures:
+            embed = discord.Embed(
+                title="📅 No Upcoming Matches",
+                description=f"No upcoming matches found for {team_full_name}",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        embeds = []
+        for fixture in fixtures[:5]:
+            embed = create_fixture_embed(fixture, f"📅 Upcoming - {team_full_name}")
+            embeds.append(embed)
+        
+        await interaction.followup.send(embeds=embeds)
+        return
+    
+    # If no team name - show all matches (today + tomorrow)
     today = datetime.now(BD_TZ).date()
     tomorrow = today + timedelta(days=1)
     
