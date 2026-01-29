@@ -113,8 +113,11 @@ def create_fixture_embed(fixture: dict, title: str) -> discord.Embed:
     elif status == "FT":
         score_text = f"✅ {home_score} - {away_score} (FT)"
         color = discord.Color.greyple()
+    elif status in ["AET", "PEN"]:
+        score_text = f"✅ {home_score} - {away_score} ({status})"
+        color = discord.Color.greyple()
     else:
-        score_text = f"{home_score or 0} - {away_score or 0}"
+        score_text = f"{home_score or 0} - {away_score or 0} ({status})"
         color = discord.Color.orange()
     
     embed = discord.Embed(title=title, color=color)
@@ -224,39 +227,48 @@ async def last_match(interaction: discord.Interaction, team_name: str):
     team_id = teams[0]["team"]["id"]
     team_full_name = teams[0]["team"]["name"]
     
-    # Search last 30 days for finished matches
-    today = datetime.now(BD_TZ).date()
-    all_fixtures = []
+    # Get current year's season fixtures
+    current_year = datetime.now().year
     
-    for days_ago in range(30):
-        check_date = today - timedelta(days=days_ago)
+    async with aiohttp.ClientSession() as session:
+        data = await api_request(session, "fixtures", {
+            "team": team_id,
+            "season": current_year,
+            "last": 20
+        })
+    
+    all_fixtures = data.get("response", [])
+    
+    # Filter for finished matches and sort by date
+    finished_statuses = ["FT", "AET", "PEN"]
+    finished_fixtures = [f for f in all_fixtures if f["fixture"]["status"]["short"] in finished_statuses]
+    
+    if not finished_fixtures:
+        # Try previous year if current year has no results
         async with aiohttp.ClientSession() as session:
             data = await api_request(session, "fixtures", {
                 "team": team_id,
-                "date": str(check_date)
+                "season": current_year - 1,
+                "last": 20
             })
         
-        fixtures = data.get("response", [])
-        finished = [f for f in fixtures if f["fixture"]["status"]["short"] == "FT"]
-        
-        if finished:
-            all_fixtures.extend(finished)
-            break
+        all_fixtures = data.get("response", [])
+        finished_fixtures = [f for f in all_fixtures if f["fixture"]["status"]["short"] in finished_statuses]
     
-    if not all_fixtures:
+    if not finished_fixtures:
         embed = discord.Embed(
             title="❌ No Recent Match",
-            description=f"No finished match found for {team_full_name} in the last 30 days",
+            description=f"No finished match found for {team_full_name}",
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed)
         return
     
-    # Sort by date and get most recent
-    all_fixtures.sort(key=lambda x: x["fixture"]["date"], reverse=True)
-    fixture = all_fixtures[0]
-    embed = create_fixture_embed(fixture, f"📊 Last Match - {team_full_name}")
+    # Sort by date (most recent first)
+    finished_fixtures.sort(key=lambda x: x["fixture"]["date"], reverse=True)
+    fixture = finished_fixtures[0]
     
+    embed = create_fixture_embed(fixture, f"📊 Last Match - {team_full_name}")
     await interaction.followup.send(embed=embed)
 
 
