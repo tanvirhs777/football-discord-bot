@@ -224,24 +224,40 @@ async def last_match(interaction: discord.Interaction, team_name: str):
     team_id = teams[0]["team"]["id"]
     team_full_name = teams[0]["team"]["name"]
     
+    # Try getting last finished match
     async with aiohttp.ClientSession() as session:
         data = await api_request(session, "fixtures", {
             "team": team_id,
-            "last": 1
+            "last": 5
         })
     
     fixtures = data.get("response", [])
     
-    if not fixtures:
+    # Filter for only finished matches
+    finished_fixtures = [f for f in fixtures if f["fixture"]["status"]["short"] == "FT"]
+    
+    if not finished_fixtures:
+        # If no FT matches, try checking today's matches
+        today = datetime.now(BD_TZ).date()
+        async with aiohttp.ClientSession() as session:
+            data = await api_request(session, "fixtures", {
+                "team": team_id,
+                "date": str(today)
+            })
+        
+        fixtures = data.get("response", [])
+        finished_fixtures = [f for f in fixtures if f["fixture"]["status"]["short"] == "FT"]
+    
+    if not finished_fixtures:
         embed = discord.Embed(
             title="❌ No Recent Match",
-            description=f"No recent match found for {team_full_name}",
+            description=f"No recent finished match found for {team_full_name}",
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed)
         return
     
-    fixture = fixtures[0]
+    fixture = finished_fixtures[0]
     embed = create_fixture_embed(fixture, f"📊 Last Match - {team_full_name}")
     
     await interaction.followup.send(embed=embed)
